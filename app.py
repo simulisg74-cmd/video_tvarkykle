@@ -54,7 +54,6 @@ GEMINI_MODEL_OPTIONS: dict[str, str] = {
     "Gemini 2.5 Flash – greitas": "gemini-2.5-flash",
 }
 DEFAULT_GEMINI_MODEL_LABEL = "Gemini 2.5 Flash – greitas"
-client = genai.Client()
 DEFAULT_APP_USERNAME = "pmc_admin"
 DEFAULT_APP_PASSWORD = "Saule2007"
 MAX_CLIP_DURATION_SEC = 60.0
@@ -154,8 +153,24 @@ def logout_user() -> None:
     st.rerun()
 
 
+def get_gemini_api_key() -> str:
+    env_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except (AttributeError, KeyError, FileNotFoundError, TypeError):
+        return ""
+
+
 def get_gemini_client() -> genai.Client:
-    return genai.Client(api_key=GEMINI_API_KEY)
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise AppError(
+            "Nerastas GEMINI_API_KEY. Nustatykite jį `.env` faile arba Streamlit Cloud Secrets."
+        )
+    return genai.Client(api_key=api_key)
 
 
 def get_firestore_client() -> firestore.Client | None:
@@ -1692,7 +1707,7 @@ def render_sidebar() -> tuple[str, set[str], str]:
             "• Galite įkelti kelis klipus vienu metu"
         )
 
-        api_ready = bool(GEMINI_API_KEY.strip())
+        api_ready = bool(get_gemini_api_key())
         if api_ready:
             st.success("Gemini API raktas sukonfigūruotas ✓")
         else:
