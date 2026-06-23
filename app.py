@@ -54,7 +54,7 @@ GEMINI_MODEL_OPTIONS: dict[str, str] = {
     "Gemini 2.5 Flash – greitas": "gemini-2.5-flash",
 }
 DEFAULT_GEMINI_MODEL_LABEL = "Gemini 2.5 Flash – greitas"
-GEMINI_API_KEY = "AQ.Ab8RN6IS5fzn4WU6PgK-Xn3pdgMniO4X-CK02vhdX0cPPb0_YQ"
+client = genai.Client()
 DEFAULT_APP_USERNAME = "pmc_admin"
 DEFAULT_APP_PASSWORD = "Saule2007"
 MAX_CLIP_DURATION_SEC = 60.0
