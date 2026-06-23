@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import hmac
+import traceback
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any, Literal
 
 import streamlit as st
 from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import credentials, firestore
 from google import genai
 from google.genai import types
 from moviepy import (
@@ -32,6 +35,13 @@ from moviepy.video import fx as vfx
 
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+FIREBASE_KEY_PATH = PROJECT_ROOT / "firebase-key.json"
+FIRESTORE_VIDEO_COLLECTION = "analizuoti_video"
+
+_firestore_client: firestore.Client | None = None
+_firestore_init_attempted = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -39,11 +49,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_VIDEO_ANALYSIS_MODEL = "gemini-2.5-flash"
 GEMINI_MODEL_OPTIONS: dict[str, str] = {
     "Gemini 2.5 Flash – greitas": "gemini-2.5-flash",
-    "Gemini 2.5 Pro – tikslus": "gemini-2.5-pro",
 }
 DEFAULT_GEMINI_MODEL_LABEL = "Gemini 2.5 Flash – greitas"
+GEMINI_API_KEY = "AQ.Ab8RN6IS5fzn4WU6PgK-Xn3pdgMniO4X-CK02vhdX0cPPb0_YQ"
 DEFAULT_APP_USERNAME = "pmc_admin"
 DEFAULT_APP_PASSWORD = "Saule2007"
 MAX_CLIP_DURATION_SEC = 60.0
@@ -144,12 +155,81 @@ def logout_user() -> None:
 
 
 def get_gemini_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise AppError(
-            "Nerastas GEMINI_API_KEY. Užpildykite .env failą arba nustatykite aplinkos kintamąjį."
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def get_firestore_client() -> firestore.Client | None:
+    global _firestore_client, _firestore_init_attempted
+
+    if _firestore_init_attempted:
+        return _firestore_client
+
+    _firestore_init_attempted = True
+
+    try:
+        if not FIREBASE_KEY_PATH.exists():
+            logger.warning(
+                "Firestore neinicializuotas: nerastas raktų failas %s",
+                FIREBASE_KEY_PATH,
+            )
+            return None
+
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(str(FIREBASE_KEY_PATH))
+            firebase_admin.initialize_app(cred)
+
+        _firestore_client = firestore.client()
+        return _firestore_client
+    except Exception:
+        traceback.print_exc()
+        logger.exception("Nepavyko inicializuoti Firestore")
+        _firestore_client = None
+        return None
+
+
+def _coerce_firestore_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def save_video_analysis_record(
+    *,
+    file_name: str,
+    criteria: str,
+    status: str,
+) -> str | None:
+    """Best-effort Firestore įrašymas. Nekelia išimčių – generavimas tęsiamas."""
+    try:
+        db = get_firestore_client()
+        if db is None:
+            return None
+
+        payload = {
+            "file_name": _coerce_firestore_text(file_name),
+            "criteria": _coerce_firestore_text(criteria),
+            "status": _coerce_firestore_text(status),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        doc_ref = db.collection(FIRESTORE_VIDEO_COLLECTION).document()
+        doc_ref.set(payload)
+        logger.info(
+            "Firestore įrašas sukurtas kolekcijoje %s: %s (%s)",
+            FIRESTORE_VIDEO_COLLECTION,
+            doc_ref.id,
+            payload["file_name"],
         )
-    return genai.Client(api_key=api_key)
+        return doc_ref.id
+    except Exception:
+        traceback.print_exc()
+        logger.exception(
+            "Nepavyko įrašyti vaizdo analizės į Firestore: %s",
+            _coerce_firestore_text(file_name),
+        )
+        return None
 
 
 def is_supported_video(filename: str) -> bool:
@@ -290,10 +370,16 @@ def analyze_video_with_gemini(
 ) -> list[HighlightSegment]:
     uploaded = None
     try:
-        uploaded = client.files.upload(
-            file=str(video_path),
-            config={"display_name": video_path.name},
-        )
+        try:
+            uploaded = client.files.upload(
+                file=str(video_path),
+                config={"display_name": video_path.name},
+            )
+        except Exception as e:
+            st.error(f"Upload failed detailed message: {str(e)}")
+            st.exception(e)
+            raise
+
         wait_for_file_active(client, uploaded.name)
 
         with VideoFileClip(str(video_path)) as probe_clip:
@@ -307,8 +393,15 @@ def analyze_video_with_gemini(
             duration,
             include_speech_flag=include_speech_flag,
         )
+        analysis_model = GEMINI_VIDEO_ANALYSIS_MODEL
+        if model_id != analysis_model:
+            logger.info(
+                "Vaizdo analizei naudojamas %s (pasirinktas %s ignoruojamas dėl greitesnio atsako).",
+                analysis_model,
+                model_id,
+            )
         response = client.models.generate_content(
-            model=model_id,
+            model=analysis_model,
             contents=[uploaded, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -664,6 +757,18 @@ def build_highlight_reel(
                 model_id,
                 include_speech_flag=include_speech_flag,
             )
+            try:
+                save_video_analysis_record(
+                    file_name=str(video_path.name),
+                    criteria=str(criteria),
+                    status="isanalizuota" if highlights else "be_rezultatu",
+                )
+            except Exception:
+                traceback.print_exc()
+                logger.exception(
+                    "Firestore įrašymas nepavyko (%s), tęsiama vaizdo generavimo eiga.",
+                    video_path.name,
+                )
             if not highlights:
                 logger.info("Vaizde %s nerasta tinkamų segmentų.", video_path.name)
                 continue
@@ -1545,7 +1650,10 @@ def render_sidebar() -> tuple[str, set[str], str]:
             key="gemini_model_label",
         )
         selected_model_id = resolve_gemini_model(selected_model_label)
-        st.caption(f"Naudojamas API modelis: `{selected_model_id}`")
+        st.caption(
+            f"Vaizdo analizei naudojamas: `{GEMINI_VIDEO_ANALYSIS_MODEL}` "
+            "(optimizuota greitam apdorojimui, mažesnė 503 rizika)."
+        )
 
         st.markdown("---")
         st.markdown('<span class="sidebar-badge">Kriterijai</span>', unsafe_allow_html=True)
@@ -1584,11 +1692,11 @@ def render_sidebar() -> tuple[str, set[str], str]:
             "• Galite įkelti kelis klipus vienu metu"
         )
 
-        api_ready = bool(os.getenv("GEMINI_API_KEY", "").strip())
+        api_ready = bool(GEMINI_API_KEY.strip())
         if api_ready:
-            st.success("Gemini API raktas rastas ✓")
+            st.success("Gemini API raktas sukonfigūruotas ✓")
         else:
-            st.warning("Trūksta GEMINI_API_KEY `.env` faile.")
+            st.warning("Gemini API raktas nekonfigūruotas.")
 
         st.markdown("---")
         if st.button("Atsijungti", use_container_width=True, key="logout_button"):
@@ -1682,6 +1790,15 @@ def render_results_section(
             type="primary",
             use_container_width=True,
         )
+
+
+def render_generation_error(exc: BaseException) -> None:
+    """Rodo generavimo klaidą Streamlit UI – su pilnu traceback neprognouojamoms klaidoms."""
+    if isinstance(exc, AppError):
+        st.error(str(exc))
+        return
+
+    st.exception(exc)
 
 
 def run_main_app() -> None:
@@ -1842,29 +1959,33 @@ def run_main_app() -> None:
                 saved_logo_path = save_uploaded_logo(logo_file, work_dir)
 
         with st.status("PMC vaizdo intelektas apdoroja klipus...", expanded=True) as processing_status:
-            processing_status.write("🤖 Gemini peržiūri jūsų klipus...")
-            output_path = build_highlight_reel(
-                media_items=saved_paths,
-                criteria=criteria,
-                model_id=selected_model_id,
-                progress_bar=progress_bar,
-                status_box=status_box,
-                background_music_path=saved_music_path,
-                mix_with_original=mix_with_original,
-                background_volume=background_volume,
-                prioritize_official_speeches=OFFICIAL_SPEECHES_KEY in selected_criteria_keys,
-                logo_path=saved_logo_path,
-            )
-            if saved_logo_path is not None:
-                processing_status.write("🏷️ Pridedamas logotipas ant galutinio vaizdo...")
-            if saved_music_path is not None and OFFICIAL_SPEECHES_KEY in selected_criteria_keys:
-                processing_status.write(
-                    "🎵 Fono muzika pritaikyta – oficialių kalbų metu garsumas sumažintas..."
+            try:
+                processing_status.write("🤖 Gemini peržiūri jūsų klipus...")
+                output_path = build_highlight_reel(
+                    media_items=saved_paths,
+                    criteria=criteria,
+                    model_id=selected_model_id,
+                    progress_bar=progress_bar,
+                    status_box=status_box,
+                    background_music_path=saved_music_path,
+                    mix_with_original=mix_with_original,
+                    background_volume=background_volume,
+                    prioritize_official_speeches=OFFICIAL_SPEECHES_KEY in selected_criteria_keys,
+                    logo_path=saved_logo_path,
                 )
-            elif saved_music_path is not None:
-                processing_status.write("🎵 Pridedama ir pritaikoma fono muzika...")
-            processing_status.write("🎞️ Sujungiami geriausi momentai į vaizdo montažą...")
-            processing_status.update(label="Vaizdo montažas sėkmingai sukurtas!", state="complete")
+                if saved_logo_path is not None:
+                    processing_status.write("🏷️ Pridedamas logotipas ant galutinio vaizdo...")
+                if saved_music_path is not None and OFFICIAL_SPEECHES_KEY in selected_criteria_keys:
+                    processing_status.write(
+                        "🎵 Fono muzika pritaikyta – oficialių kalbų metu garsumas sumažintas..."
+                    )
+                elif saved_music_path is not None:
+                    processing_status.write("🎵 Pridedama ir pritaikoma fono muzika...")
+                processing_status.write("🎞️ Sujungiami geriausi momentai į vaizdo montažą...")
+                processing_status.update(label="Vaizdo montažas sėkmingai sukurtas!", state="complete")
+            except Exception:
+                processing_status.update(label="Generavimas nepavyko", state="error")
+                raise
 
         with VideoFileClip(str(output_path)) as final_clip:
             final_duration = float(final_clip.duration or 0.0)
@@ -1884,13 +2005,14 @@ def run_main_app() -> None:
     except AppError as exc:
         progress_bar.empty()
         status_box.empty()
-        st.error(str(exc))
+        render_generation_error(exc)
         logger.warning("Naudotojo klaida: %s", exc)
     except Exception as exc:
         progress_bar.empty()
         status_box.empty()
-        st.error("Įvyko netikėta klaida generuojant vaizdo įrašą. Patikrinkite serverio logus.")
-        logger.exception("Netikėta klaida: %s", exc)
+        render_generation_error(exc)
+        traceback.print_exc()
+        logger.exception("Netikėta klaida generuojant vaizdo įrašą: %s", exc)
     finally:
         cleanup_directory(work_dir)
 
